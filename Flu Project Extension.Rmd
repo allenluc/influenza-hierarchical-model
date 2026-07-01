@@ -1,0 +1,193 @@
+---
+title: "Flu Project Extension"
+author: "Lucas Allen"
+date: "2026-06-25"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+This project is an extension of the national influenza forecasting model that explores a hierarchical structure across the ten United States Department of Health and Human Services (HHS) regions. The motivating idea behind this is that flu does not behave identically everywhere. Some regions run hotter and some colder, and the strength of week-to-week momentum may itself differ between regions. A hierarchical model captures this by allowing each region its own parameters while sharing information across regions using partial pooling, producing more stable estimates than fitting ten separate models would. The central question focused in this project is as follows: does modeling regional structure meaningfully improve forecasting, and how do the regions actually differ?
+\newpage
+\textbf{Data and Feature Construction} $\\$
+```{r}
+#Libraries
+library(tidyverse)
+library(brms)
+library(ggplot2)
+```
+
+```{r}
+#Import dataset into R
+pa = "H:/RStudio Files/data/FluViewPhase2DataRegional/ILINetRegional.csv"
+df = read.csv(pa, skip = 1)
+colnames(df)
+```
+Similar to the national influenza project, this data is the regional ILINet export from CDC, covering all ten HHS regions weekly from 1997 to 2026. Cleaning is very similar to that of the national project: convert "X"-coded missing values to NA, rename columns, and use coalesce to reconcile the age bands. One addition to the structure is converting region to a factor, which is required by the model to treat it as a grouping variable.
+```{r}
+num_cols = c("X..WEIGHTED.ILI","X.UNWEIGHTED.ILI","AGE.0.4","AGE.5.24",
+             "AGE.25.49","AGE.25.64","AGE.50.64","AGE.65","ILITOTAL",
+             "NUM..OF.PROVIDERS","TOTAL.PATIENTS")
+
+df_clean = df %>%
+  mutate(across(all_of(num_cols), ~ suppressWarnings(as.numeric(.)))) %>%
+  rename(
+    region_type = REGION.TYPE,
+    region = REGION,
+    year = YEAR,
+    week = WEEK,
+    wili = X..WEIGHTED.ILI,
+    ili = X.UNWEIGHTED.ILI,
+    age_0_4 = AGE.0.4,
+    age_5_24  = AGE.5.24,
+    age_25_49 = AGE.25.49,
+    age_25_64 = AGE.25.64,
+    age_50_64 = AGE.50.64,
+    age_65 = AGE.65,
+    ili_total = ILITOTAL,
+    providers = NUM..OF.PROVIDERS,
+    total_pat = TOTAL.PATIENTS
+  )
+
+df_clean = df_clean %>% mutate(region = factor(region))
+
+summary(df_clean)
+```
+The data comprise 14,980 weekly observations, ten regions of 1,498 weeks each, with weighted ILI fully populated at the regional level. A feature that is important to note is that regional wILI is even more right-skewed than at the national level (maximum of 16 versus 8), since individual regions have local peaks that are sharper than the national average tends to smooth out. This further reinforces choosing a skewed and strictly positive likelihood for the model.
+```{r}
+model_df = df_clean %>%
+  arrange(region, year, week) %>%
+  group_by(region) %>%
+  mutate(
+    sinYear = sin(2 * pi * week / 52),
+    cosYear = cos(2 * pi * week / 52),
+    
+    wili_lag1 = lag(wili, 1),
+    wili_lag2 = lag(wili, 2),
+    
+    peds = age_0_4 + age_5_24,
+    adults = coalesce(age_25_49 + age_50_64, age_25_64),
+    elderly = age_65,
+    age_denom = peds + adults + elderly,
+    share_peds_lag1 = lag(peds / age_denom, 1),
+    share_elderly_lag1 = lag(elderly / age_denom, 1),
+    
+    pandemic_era = ifelse(year %in% c(2020, 2021), 1, 0),
+    
+    wili_next = lead(wili, 1)
+  ) %>% ungroup()
+```
+Creating new features follows the same approach from the national project with one crucial difference: all lags and leads must be computed within each of the ten regions separately. Grouping by region before lagging prevents one region's final week from being treated as the prior week of the next region, which would corrupt the features without warning.
+```{r}
+model_df %>%
+  group_by(region) %>%
+  slice(1) %>%
+  select(region, year, week, wili, wili_lag1, wili_lag2) %>%
+  print(n = 10)
+```
+These results confirm grouping worked. The first observation of every region shows missing lags, since no prior week exists within each region. Had the grouping failed, only the very first row of the entire dataset would have been missing. $\\\\$
+Using the same logic as in the national analysis, the train/test split is made at the 2022 boundary to prevent look-ahead leakage. Both the training and testing sets retain all ten regions, confirming that no region was lost to missingness during filtering.
+```{r}
+threshold = 3.0
+
+feat_base = c("wili_lag1", "wili_lag2", "sinYear", "cosYear")
+feat_age = c(feat_base, "share_peds_lag1", "share_elderly_lag1")
+
+cutoff = 2022
+train_df = model_df %>%
+  filter(year < cutoff) %>%
+  drop_na(all_of(c("wili_next", feat_age)))
+test_df = model_df %>%
+  filter(year >= cutoff) %>%
+  drop_na(all_of(c("wili_next", feat_age)))
+
+nrow(train_df); nrow(test_df)
+n_distinct(train_df$region); n_distinct(test_df$region)
+```
+
+```{r}
+train_df = train_df %>% mutate(wili_next_pos = wili_next + 0.01)
+test_df = test_df %>% mutate(wili_next_pos = wili_next + 0.01)
+```
+\newpage
+\textbf{The Hierarchical Model} $\\$
+The hierarchical model adds a region-level term, (1 + wili_lag1 | region), to the Gamma regression. This allows each region its own intercept (its baseline flu level) and its own slope on the previous week's activity (its momentum), while estimating how much these vary by region. That estimated variation is what drives partial pooling: regions with abundant, clean data retain estimates close to their own pattern, while noisier regions are pulled toward the overall average, borrowing strength from others. The intercept and the strongest predictor are the only coefficients allowed to vary by region, which is a deliberate choice to keep the model tractable rather than letting all of the coefficients vary at the same time.
+```{r, results = 'hide'}
+fit_hier = brm(
+  bf(wili_next_pos ~ wili_lag1 + wili_lag2 + sinYear + cosYear + share_peds_lag1
+     + share_elderly_lag1 + (1 + wili_lag1 | region)),
+  data = train_df,
+  family = Gamma(link = "log"),
+  chains = 4, cores = 4, iter = 2000, seed = 123,
+  refresh = 0
+)
+```
+
+```{r}
+summary(fit_hier)
+```
+Per the summary above, the model displayed clean convergence, with all R-hat values either at or near 1.00. The new section, "Multilevel Hyperparameters", quantifies the regional variation: the standard deviation of the region intercepts (0.37 on the log scale) is clearly non-zero, which confirms that regions have a genuine difference in baseline activity. The strong negative correlation between region intercepts and lag-slopes (-0.98) shows that regions with higher baseline activity tend to rely less on recent momentum, while lower-baseline regions swing more with it. Among the national-average fixed effects, the lagged elderly share remains credibly negative, consistent with the national model, while the pediatric share is no longer credibly different from zero. This suggests its apparent national signal is partially absorbed once regional structure is accounted for.
+```{r}
+pp_check(fit_hier) + xlim(0, 20)
+```
+As shown in the posterior predictive check above, simulated data closely track the observed distribution across the full range, confirming the Gamma likelihood remains well-specified on the regional data.
+\newpage
+\textbf{Regional Variation}$\\$
+```{r}
+region_effects = ranef(fit_hier)$region[, , "Intercept"] %>%
+  as.data.frame() %>%
+  rownames_to_column("region") %>%
+  rename(intercept_dev = Estimate) %>%
+  select(region, intercept_dev)
+region_effects
+```
+The intercept deviations shown above rank the regions by baseline flu intensity on the log scale, where positive values indicate hotter-than-average regions. Region 6 (which covers the south-central states) is the hottest, while Region 1 is the coolest. Because this ranking is estimated from the full time series rather than any individual week, it is more reliable than the snapshot a few raw observations would suggest.
+```{r}
+postPredHier = posterior_predict(fit_hier, newdata = test_df)
+
+test_df = test_df %>% mutate(
+  pred = colMeans(posterior_epred(fit_hier, newdata = test_df)),
+  risk = colMeans(postPredHier > threshold)
+)
+
+test_df = test_df %>%
+  mutate(date = as.Date(paste(year, week, 1, sep = "-"), "%Y-%U-%u"))
+```
+
+```{r}
+ggplot(test_df, aes(date, risk)) +
+  geom_col(fill = "darkorange") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", col = "grey40") +
+  facet_wrap(~ region, ncol = 2) +
+  labs(title = "Estimated Weekly Risk of Elevated Flu Activity by HHS Region",
+       subtitle = paste0("P(next-week wILI > ", threshold, "%), held-out seasons"),
+       x = NULL, y = "Probability of Elevated Activity") +
+  theme_minimal()
+```
+Faceting the risk estimates by region reveals the payoff of the hierarchical model. Every region shows the expected seasonal pulse, but with clear differences in shape and intensity. Hotter regions such as 2 and 6 produce broad, sustained blocks of elevated risk across many consecutive weeks, while colder regions such as 1 and 8 show narrower, more spiky pulses. These differences, which the national model could not show, are what the regional structure was built to capture.
+\newpage
+\textbf{Does the Hierarchical Structure Improve Prediction?} $\\$
+The test of whether the regional structure justifies its added complexity is a leave-one-out cross-validation comparison against an otherwise identical model with no regional term, fit on the same data.
+```{r, results = 'hide'}
+fit_flat = brm(
+  bf(wili_next_pos ~ wili_lag1 + wili_lag2 + sinYear + cosYear + 
+       share_peds_lag1 + share_elderly_lag1),
+  data = train_df,
+  family = Gamma(link = "log"),
+  chains = 4, cores = 4, iter = 2000, seed = 123,
+  refresh = 0
+)
+```
+
+```{r}
+loo_hier = loo(fit_hier)
+loo_flat = loo(fit_flat)
+loo_compare(loo_hier, loo_flat)
+```
+The result is undeniable. The hierarchical model outperforms the flat model by approximately 885 units of expected log predictive density (SE $\approx$ 50), which is a difference of around 18 standard errors. For reference, the commonly used threshold is 2 standard errors. Modeling regional structure is not a marginal refinement but a substantial improvement in predictive accuracy. With nearly 12,000 observations, large differences are detectable with high precision, so the magnitude is best interpreted as decisive rather than literal. This result confirms that influenza activity is meaningfully different across regions, a conclusion that the national model could not have reached.
+\newpage
+\textbf{Conclusion} $\\$
+This extension set out to determine whether modeling influenza activity hierarchically across the ten HHS regions improves on the single national model. Using the regional ILINet data and a Gamma regression with region-level intercepts and slopes, the model captured substantial variation in both baseline flu intensity and week-to-week momentum across regions, while partial pooling kept each region's estimates stable. Leave-one-out cross-validation showed the hierarchical model to be a definite improvement over an equivalent non-hierarchical model, confirming that regional differences carry real predictive value. The resulting risk curves for each region are the practical output of this extension, as they show how the timing and intensity of elevated-activity risk differ across the country in a way the national model could not show.
+
+Several extensions still remain. Allowing more coefficients to vary by region, incorporating the pandemic-era indicator, or modeling spatial correlation between neighboring regions could each refine this approach further. The model could also be extended to forecast multiple weeks ahead, or paired with the national model to provide forecasts at both scales simultaneously.
